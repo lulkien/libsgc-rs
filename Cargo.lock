@@ -170,6 +170,7 @@ dependencies = [
 [[package]]
 name = "simple-graphics-protocol"
 version = "0.1.0"
+source = "git+https://github.com/lulkien/simple-graphics-protocol.git#cd67a6b028a0cb43a53f8a943db1ec3dc0e33efd"
 dependencies = [
  "nix",
  "rmp-serde",

@@ -9,9 +9,8 @@ license = "Unlicense"
 description = "Rust client library for the simple-graphics-controller daemon"
 
 [dependencies]
-# Sibling repo in dev; switch to a git dep once both are pushed:
-# simple-graphics-protocol = { git = "git@github.com:lulkien/simple-graphics-protocol.git" }
-simple-graphics-protocol = { path = "../simple-graphics-protocol" }
+# The wire contract, from its own repo (public, no auth needed).
+simple-graphics-protocol = { git = "https://github.com/lulkien/simple-graphics-protocol.git" }
 sendfd = "0.4.4"
 thiserror = "1"
 # poll(2) for the pump's bounded wait (set_read_timeout cannot express
