@@ -1,0 +1,19 @@
+# The Rust client library for the simple-graphics-controller daemon (@sgc).
+# Standalone crate (own repo) so external consumers (e.g. the slint linuxsgc
+# backend fork) can depend on it by path in dev, git once published.
+[package]
+name = "libsgc-rs"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+description = "Rust client library for the simple-graphics-controller daemon"
+
+[dependencies]
+# Sibling repo in dev; switch to a git dep once both are pushed:
+# simple-graphics-protocol = { git = "git@github.com:lulkien/simple-graphics-protocol.git" }
+simple-graphics-protocol = { path = "../simple-graphics-protocol" }
+sendfd = "0.4.4"
+thiserror = "1"
+# poll(2) for the pump's bounded wait (set_read_timeout cannot express
+# "poll once" / "block forever": SO_RCVTIMEO treats 0 as no timeout).
+libc = "0.2"
