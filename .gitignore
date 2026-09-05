@@ -1,1 +1,4 @@
 /target
+
+# Cargo.lock is not committed: git-dep crates re-resolve on build; avoid stale-rev pins
+Cargo.lock
