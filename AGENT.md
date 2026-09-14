@@ -36,9 +36,9 @@ Rust client library for the simple-graphics-controller daemon (@sgc). Drives `Sg
 - [`anti-type-erasure`] — Don't use `Box<dyn Trait>` when `impl Trait` works — the client struct uses concrete types
 
 ## Key Types & Functions
-- `SgcClient` — owns granted fds in `held: HashMap<Resource, OwnedFd>`; `fd(resource)` lends a dup; `acquire(resource)` blocks until granted; `pump(timeout)` waits for one server frame
+- `SgcClient` — owns granted fds in `held: HashMap<Resource, OwnedFd>`; `fd(resource)` lends a dup; `acquire(resource)` waits for the answer to that request — a frame that answers something else is kept for `pump`, and a request the daemon queues returns `SgcError::Queued` with the grant arriving later as an event; `pump(timeout)` waits for one server frame
 - `SgcEvent` — `Revoked { resource }` (drop fd, stop drawing), `Granted { resource, fd }` (fresh dup, owned by caller), or `Advertised { available_resources }` (the server's list changed: a device appeared or was removed — the whole list, so the app replaces its view)
-- `SgcError` — variants: `ConnectFailed`, `Denied { reason }`, `NotHeld { resource }`, `NotAvailable { resource }`, `Protocol(ProtocolError)`, `UnexpectedMessage(ServerMessage)`, `Io(io::Error)`
+- `SgcError` — variants: `ConnectFailed`, `Denied { reason }`, `NotHeld { resource }`, `NotAvailable { resource }`, `Queued { resource }`, `Protocol(ProtocolError)`, `UnexpectedMessage(ServerMessage)`, `Io(io::Error)`
 - `OwnedFd` — Unix fd ownership via `ownership::OwnedFd`; `fd.as_raw_fd()` for C ABI interop
 - `read_framed`, `write_frame` — internal helpers for framing + SCM_RIGHTS fd passing
 - `fake_server`, `FakeController` — test helpers in `#[cfg(test)] mod tests`
@@ -55,6 +55,6 @@ Rust client library for the simple-graphics-controller daemon (@sgc). Drives `Sg
 ## Test Conventions
 - All tests in `#[cfg(test)] mod tests { }` within `client.rs`
 - Use `fake_server` / `FakeController` for bidirectional protocol tests
-- Tests demonstrate: connect, acquire-denied, acquire-grant-holds-fd-and-lends-dup, pump flow, roundtrip mappings
+- Tests demonstrate: connect, acquire-denied, acquire-grant-holds-fd-and-lends-dup, an event arriving before the reply, a queued acquire that must not hang, pump flow, roundtrip mappings
 - Use `sendfd::SendWithFd`/`RecvWithFd` for SCM_RIGHTS fd passing in tests
 - Tests should compile and run without external dependencies (fake in-process server)

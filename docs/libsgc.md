@@ -18,7 +18,7 @@ its `wire_dump` golden bytes.
 
 ```mermaid
 flowchart TD
-    Core["libsgc core (Rust)<br/>SgcClient: pump-based, no background threads<br/>connect/acquire = blocking request/answer<br/>pump: one frame → Option&lt;SgcEvent&gt;<br/>revoke/regrant lifecycle, Ack, fd lending"]
+    Core["libsgc core (Rust)<br/>SgcClient: pump-based, no background threads<br/>connect = one request/answer; acquire waits for ITS reply and keeps other frames<br/>pump: one frame → Option&lt;SgcEvent&gt;<br/>revoke/regrant lifecycle, Ack, fd lending"]
     Core -->|native| Rust["Rust apps"]
     Core -->|"C ABI (libsgc-c)"| CApi["include/libsgc.h<br/>sgc_* functions, opaque handle"]
     CApi --> C["C apps (kmscube -L style)"]
@@ -43,7 +43,7 @@ stateDiagram-v2
 ## The pump core
 
 ```rust
-pub struct SgcClient { /* stream, held canonicals, pending acquire */ }
+pub struct SgcClient { /* stream, held canonicals, fatal, pending events */ }
 
 impl SgcClient {
     pub fn connect() -> Result<(Self, Vec<Resource>), SgcError>;
@@ -93,6 +93,7 @@ callback wrapper over `pump(None)`.
 | connect: bad frame / not Advertise | `Protocol` / `UnexpectedMessage` |
 | acquire: resource not offered | `NotAvailable { resource }` |
 | acquire: server deny | `Denied { reason }` |
+| acquire: server queued it (no reply) | `Queued { resource }` |
 | acquire: grant without exactly 1 fd | `Io(InvalidData)` |
 | wire / decode failure | `Io` / `Protocol` |
 | `fd()` of an unheld resource | `NotHeld { resource }` |
@@ -125,7 +126,7 @@ Resource kinds are flat ints (kind+index = full round-trip of the Rust enum):
 typedef struct sgc_client sgc_client;          /* opaque */
 typedef struct { int kind; int index; } sgc_resource;
 typedef struct {
-    int kind;           /* SGC_EVENT_REVOKED | SGC_EVENT_GRANTED */
+    int kind;           /* SGC_EVENT_REVOKED | SGC_EVENT_GRANTED | SGC_EVENT_ADVERTISED */
     sgc_resource resource;
     int fd;             /* GRANTED only: owned by caller, close() it */
 } sgc_event;
@@ -150,6 +151,8 @@ ABI rules:
   so next to each fd-returning signature).
 - `sgc_pump` → `1` event stored, `0` nothing, `-1` connection error;
   `timeout_ms` = `-1` block / `0` poll once / `>0` ms.
+- a changed resource list is an event, not silence: `SGC_EVENT_ADVERTISED`,
+  carrying no resource and no fd — read the new list with `sgc_advertised`.
 - advertised list = malloc'd array, freed with `sgc_free`.
 
 Header is handwritten (~6 fns + 2 structs); cbindgen only if the surface
