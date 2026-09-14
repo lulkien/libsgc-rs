@@ -3,7 +3,7 @@
 # backend fork) can depend on it by path in dev, git once published.
 [package]
 name = "libsgc-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Unlicense"
 description = "Rust client library for the simple-graphics-controller daemon: acquire a display lease and its input devices, and drive the revoke/re-grant session"

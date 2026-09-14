@@ -12,7 +12,7 @@
 //! resources are held — the server's 5s revoke/ack deadlines are real.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{self, ErrorKind, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
@@ -29,6 +29,13 @@ use simple_graphics_protocol::{
 };
 
 use crate::error::SgcError;
+
+/// How long [`SgcClient::acquire`] waits for its own reply before calling the
+/// request queued. Every non-queued answer (grant, deny) comes back in
+/// milliseconds; a queued one gets NO reply, and its `Grant` arrives later as
+/// an event — so a short wait here is what keeps a queued ask from stalling the
+/// caller (and a UI's timer with it) for the daemon's whole revoke deadline.
+const ACQUIRE_REPLY_WAIT: Duration = Duration::from_millis(250);
 
 /// Events delivered to the app through the event-loop callback.
 ///
@@ -72,6 +79,11 @@ pub struct SgcClient {
     /// [`SgcClient::pump`] first surfaces [`SgcEvent::Revoked`] for every
     /// held resource (one per call), then this error.
     fatal: Option<SgcError>,
+    /// Events that arrived while [`SgcClient::acquire`] was waiting for its
+    /// reply: the daemon pushes the resource list, revokes, and grants queued
+    /// requests whenever it likes, so a reply is not necessarily the next
+    /// frame. They are handed out by [`SgcClient::pump`] before the socket.
+    pending: VecDeque<SgcEvent>,
 }
 
 impl SgcClient {
@@ -104,6 +116,7 @@ impl SgcClient {
                         stream,
                         held: HashMap::new(),
                         fatal: None,
+                        pending: VecDeque::new(),
                     },
                     available_resources,
                 ))
@@ -112,38 +125,58 @@ impl SgcClient {
         }
     }
 
-    /// Request `resource` and BLOCK until the server answers. On grant the
-    /// fd is stored in `held` (client-owned); the app borrows it via
-    /// [`SgcClient::fd`]. On `Deny` nothing is held.
+    /// Request `resource` and wait for the server's answer to THAT request.
+    ///
+    /// The answer is not necessarily the next frame: the server pushes its
+    /// resource list, revokes and re-grants whenever it likes, and a request it
+    /// QUEUES gets no answer at all. Frames that answer something else are kept
+    /// for [`SgcClient::pump`]; a queued request returns [`SgcError::Queued`]
+    /// after a short wait, and its `Grant` arrives later as
+    /// [`SgcEvent::Granted`]. On a grant the fd is stored in `held`
+    /// (client-owned) and the app borrows it via [`SgcClient::fd`]; on a `Deny`
+    /// nothing is held.
     pub fn acquire(&mut self, resource: Resource) -> Result<(), SgcError> {
         self.write_frame(&ClientRequest::Acquire {
             resource: resource.clone(),
         })?;
 
-        let (msg, fds) = read_framed(&mut self.stream)?;
-        match msg {
-            ServerMessage::Grant { resource: granted } => {
-                if fds.len() != 1 {
-                    return Err(SgcError::Io(io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("grant carried {} fds, expected 1", fds.len()),
-                    )));
-                }
-                if granted != resource {
-                    return Err(SgcError::UnexpectedMessage(ServerMessage::Grant {
-                        resource: granted,
-                    }));
-                }
-                // Safety: the fd arrived via SCM_RIGHTS, which transfers
-                // ownership to this process.
-                let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-                // Ack the grant: the server waits up to 5s for it.
-                self.write_frame(&ClientRequest::Ack)?;
-                self.held.insert(resource, fd);
-                Ok(())
+        // The reply may not be the next frame: the daemon pushes its resource
+        // list, revokes, and re-grants whenever it likes, and an acquire it
+        // QUEUES gets no reply at all (the Grant arrives later as an event, see
+        // `AcquireOutcome::Queued`). Reading one frame and calling anything else
+        // an error desynchronised the stream for every later call, which is how
+        // a re-acquire after a handover used to lose devices.
+        let deadline = std::time::Instant::now() + ACQUIRE_REPLY_WAIT;
+
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() || !self.poll_readable(Some(left))? {
+                return Err(SgcError::Queued { resource });
             }
-            ServerMessage::Deny { reason } => Err(SgcError::Denied { reason }),
-            other => Err(SgcError::UnexpectedMessage(other)),
+
+            // A read error here means the connection is over: fail this
+            // acquire, and let the next `pump` end the session properly (its
+            // read sees the same dead stream and drains what we still hold).
+            let (msg, fds) = read_framed(&mut self.stream)?;
+
+            match msg {
+                ServerMessage::Grant { resource: granted } if granted == resource => {
+                    // Our answer. `handle_message` stores the canonical, acks it
+                    // and lends the dup; the caller borrows with `fd()`.
+                    self.handle_message(ServerMessage::Grant { resource: granted }, fds)?;
+                    return Ok(());
+                }
+                ServerMessage::Deny { reason } => {
+                    close_fds(fds);
+                    return Err(SgcError::Denied { reason });
+                }
+                // Not ours: keep it for the event loop and keep waiting.
+                other => {
+                    if let Some(event) = self.handle_message(other, fds)? {
+                        self.pending.push_back(event);
+                    }
+                }
+            }
         }
     }
 
@@ -187,6 +220,10 @@ impl SgcClient {
     /// returned for each held resource, one per `pump` call, in no
     /// particular order — then the error surfaces.
     pub fn pump(&mut self, timeout: Option<Duration>) -> Result<Option<SgcEvent>, SgcError> {
+        // Events kept aside while `acquire` waited for its reply come first.
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(Some(event));
+        }
         // Disconnect drain: the stream died on an earlier call; surface
         // one Revoked per still-held resource, then the fatal error.
         if self.fatal.is_some() {
@@ -199,6 +236,17 @@ impl SgcClient {
             Ok(frame) => frame,
             Err(err) => return self.begin_disconnect(err),
         };
+        self.handle_message(msg, fds)
+    }
+
+    /// Turn one server frame into the client's state change and, when there is
+    /// one, the event the application sees. Shared by [`SgcClient::pump`] and
+    /// [`SgcClient::acquire`] so both keep the same semantics.
+    fn handle_message(
+        &mut self,
+        msg: ServerMessage,
+        fds: Vec<RawFd>,
+    ) -> Result<Option<SgcEvent>, SgcError> {
         match msg {
             ServerMessage::Revoke { resource } => {
                 // Drop the canonical; the app drops its dup on Revoked.
@@ -374,13 +422,123 @@ mod tests {
     use std::{
         io::{Read, Write},
         os::{
-            fd::AsRawFd,
+            fd::{AsRawFd, IntoRawFd},
             linux::net::SocketAddrExt,
             unix::net::{SocketAddr, UnixListener},
         },
         sync::mpsc,
         thread,
     };
+
+    /// Like [`fake_server`], but sends a SEQUENCE of messages after the opening
+    /// `Advertise` — for the cases where the reply is not the next frame.
+    fn fake_server_seq(
+        name: &'static [u8],
+        frames: Vec<(ServerMessage, Option<RawFd>)>,
+    ) -> (thread::JoinHandle<()>, mpsc::Receiver<()>) {
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let handle = thread::spawn(move || {
+            let addr = SocketAddr::from_abstract_name(name).expect("address");
+            let listener = UnixListener::bind_addr(&addr).expect("bind");
+            ready_tx.send(()).expect("ready signal");
+            let (mut stream, _) = listener.accept().expect("accept");
+            let adv = serialize_framed(&ServerMessage::Advertise {
+                available_resources: vec![Resource::Fbdev],
+            })
+            .expect("serialize advertise");
+            stream.write_all(&adv).expect("write advertise");
+            for (msg, fd) in frames {
+                let frame = serialize_framed(&msg).expect("serialize frame");
+                match fd {
+                    Some(fd) => {
+                        stream
+                            .send_with_fd(&frame, &[fd])
+                            .expect("send frame with fd");
+                    }
+                    None => stream.write_all(&frame).expect("write frame"),
+                }
+            }
+            let mut buf = [0u8; 64];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        (handle, ready_rx)
+    }
+
+    /// The daemon pushes its list whenever it changes, so a reply can arrive
+    /// behind an `Advertise`. `acquire` must keep it and still return Ok.
+    #[test]
+    fn acquire_survives_an_event_that_arrives_first() {
+        let fd = std::fs::File::open("/dev/null").expect("fd").into_raw_fd();
+        let (server, ready) = fake_server_seq(
+            b"sgc-test-interleaved",
+            vec![
+                (
+                    ServerMessage::Advertise {
+                        available_resources: vec![Resource::Fbdev, Resource::Drm { card: 1 }],
+                    },
+                    None,
+                ),
+                (
+                    ServerMessage::Grant {
+                        resource: Resource::Fbdev,
+                    },
+                    Some(fd),
+                ),
+            ],
+        );
+        ready.recv().expect("server ready");
+        let (mut client, _) = SgcClient::connect_at(b"sgc-test-interleaved").expect("connect");
+
+        client
+            .acquire(Resource::Fbdev)
+            .expect("the interleaved push must not break the acquire");
+        assert!(client.held().contains(&Resource::Fbdev), "granted and held");
+
+        // ... and the event it skipped is not lost.
+        let event = client.pump(Some(Duration::from_millis(100))).expect("pump");
+        assert!(
+            matches!(
+                event,
+                Some(SgcEvent::Advertised { ref available_resources })
+                    if available_resources.len() == 2
+            ),
+            "expected the pushed list, got {event:?}"
+        );
+
+        drop(client);
+        let _ = server.join();
+    }
+
+    /// A queued acquire gets no reply: it must come back as `Queued` (not as a
+    /// desynchronised error) and quickly, because the Grant arrives later as an
+    /// event.
+    #[test]
+    fn acquire_reports_a_queue_instead_of_desyncing() {
+        let (server, ready) = fake_server_seq(b"sgc-test-queued", vec![]);
+        ready.recv().expect("server ready");
+        let (mut client, _) = SgcClient::connect_at(b"sgc-test-queued").expect("connect");
+
+        let started = std::time::Instant::now();
+        let err = client
+            .acquire(Resource::Fbdev)
+            .expect_err("nothing was granted");
+        assert!(
+            matches!(err, SgcError::Queued { ref resource } if *resource == Resource::Fbdev),
+            "expected Queued, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "the queued answer must not hang the caller"
+        );
+
+        drop(client);
+        let _ = server.join();
+    }
 
     /// Minimal fake controller: bind an abstract listener, signal `ready`,
     /// accept one client, send `Advertise`, optionally reply with `reply`

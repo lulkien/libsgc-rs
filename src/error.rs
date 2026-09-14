@@ -17,6 +17,13 @@ pub enum SgcError {
     #[error("acquire denied: {reason}")]
     Denied { reason: String },
 
+    /// The server accepted the request but queued it: the device is held by
+    /// somebody else, and the `Grant` will arrive later through
+    /// [`crate::SgcEvent::Granted`]. Nothing is held yet — keep pumping, do not
+    /// ask again (a second ask would only queue a second time).
+    #[error("acquire queued for {resource:?}: a Grant will arrive as an event")]
+    Queued { resource: Resource },
+
     /// Tried to borrow a resource this session does not hold.
     #[error("resource not held: {resource:?}")]
     NotHeld { resource: Resource },

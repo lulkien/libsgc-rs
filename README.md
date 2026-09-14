@@ -16,7 +16,12 @@ No background threads, no shared state, no callbacks required.
   daemon currently advertises. That list is a snapshot: the daemon pushes a fresh
   one ([`SgcEvent::Advertised`]) whenever it changes, which is how a device
   plugged in later reaches an app that is already running.
-- **Acquire** — [`SgcClient::acquire`] blocks until the daemon grants or denies
+- **Acquire** — [`SgcClient::acquire`] waits for the answer to that request; a
+  request the daemon QUEUES gets no answer (two-class priority: the device is
+  held by another client), so it returns [`SgcError::Queued`] after a short wait
+  and the `Grant` arrives later as an event. Frames that answer something else
+  are kept for `pump`, never treated as a broken stream. It otherwise blocks
+  until the daemon grants or denies
   the resource.
 - **Hold and borrow** — the client owns the granted fd; [`SgcClient::fd`] returns
   a **dup** of it, never the canonical. The canonical is dropped on revoke or
