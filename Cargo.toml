@@ -6,11 +6,21 @@ name = "libsgc-rs"
 version = "0.1.0"
 edition = "2024"
 license = "Unlicense"
-description = "Rust client library for the simple-graphics-controller daemon"
+description = "Rust client library for the simple-graphics-controller daemon: acquire a display lease and its input devices, and drive the revoke/re-grant session"
+repository = "https://github.com/lulkien/libsgc-rs"
+readme = "README.md"
+keywords = ["drm", "kiosk", "display", "ipc", "lease"]
+categories = ["api-bindings", "os::unix-apis", "graphics"]
+rust-version = "1.85"
+# Agent notes are for this repo, not for the published crate.
+exclude = ["AGENT.md"]
 
 [dependencies]
 # The wire contract, from its own repo (public, no auth needed).
-simple-graphics-protocol = { git = "https://github.com/lulkien/simple-graphics-protocol.git" }
+# Path for local development (a sibling checkout), version for the published
+# crate: cargo records only the version, and a consumer without the sibling
+# resolves it from the registry.
+simple-graphics-protocol = { version = "0.1", path = "../simple-graphics-protocol" }
 sendfd = "0.4.4"
 thiserror = "1"
 # poll(2) for the pump's bounded wait (set_read_timeout cannot express
