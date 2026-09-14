@@ -24,8 +24,8 @@ use std::{
 
 use sendfd::RecvWithFd;
 use simple_graphics_protocol::{
-    deserialize, parse_frame_header, serialize_framed, ClientRequest, Resource, ServerMessage,
-    FRAME_HEADER_LEN,
+    ClientRequest, FRAME_HEADER_LEN, Resource, ServerMessage, deserialize, parse_frame_header,
+    serialize_framed,
 };
 
 use crate::error::SgcError;
@@ -41,11 +41,21 @@ pub enum SgcEvent {
     /// revoke-ack; the server waits up to 5s for it) before returning
     /// this event.
     Revoked { resource: Resource },
-    /// The server re-granted `resource` after a revoke (we were requeued):
-    /// a fresh dup of the device fd, owned by the app, valid until the
-    /// next [`SgcEvent::Revoked`]. The protocol `Ack` was already sent by
-    /// the library — no second `acquire` needed.
+    /// The server granted `resource` without an `acquire` of ours — either it
+    /// re-granted after a revoke (we were requeued), or the device behind a
+    /// resource we already hold went away and came back, in which case this is
+    /// simply the device again under the same name. Either way it is a fresh
+    /// dup of the device fd, owned by the app, valid until the next
+    /// [`SgcEvent::Revoked`], and it REPLACES the fd we had for that resource.
+    /// The protocol `Ack` was already sent by the library — no second `acquire`
+    /// needed.
     Granted { resource: Resource, fd: OwnedFd },
+    /// The server's list of available resources changed — a device was plugged
+    /// in or removed. The app's initial view came from [`SgcClient::connect`];
+    /// this is the update, and it is the only way a connection that is already
+    /// up learns about a device that appeared later. The list is the whole list
+    /// (not a delta), so a missed event costs nothing.
+    Advertised { available_resources: Vec<Resource> },
 }
 
 /// A connected session to the graphics controller, driven by one thread.
@@ -218,6 +228,14 @@ impl SgcClient {
                         Ok(None)
                     }
                 }
+            }
+            ServerMessage::Advertise {
+                available_resources,
+            } => {
+                close_fds(fds);
+                Ok(Some(SgcEvent::Advertised {
+                    available_resources,
+                }))
             }
             other => {
                 eprintln!("unexpected server message: {other:?}; ignoring");
@@ -686,6 +704,35 @@ mod tests {
         }
         assert_eq!(controller.next_request(), ClientRequest::Ack);
         assert_eq!(client.held(), vec![Resource::Fbdev]);
+        drop(client);
+        drop(controller);
+    }
+
+    /// The server pushes its list again whenever a device appears or goes away.
+    /// It is the only way a connection that is already up learns about a device
+    /// plugged in later, so it has to surface as an event rather than being
+    /// swallowed as an unexpected message.
+    #[test]
+    fn pump_delivers_a_pushed_advertise() {
+        use simple_graphics_protocol::InputResource;
+
+        let controller = fake(b"sgc-test-push", vec![Resource::Fbdev]);
+        let (mut client, advertised) = SgcClient::connect_at(b"sgc-test-push").expect("connect");
+        assert_eq!(advertised, vec![Resource::Fbdev]);
+
+        let keyboard = Resource::Input(InputResource::Keyboard(0));
+        controller.send(
+            ServerMessage::Advertise {
+                available_resources: vec![Resource::Fbdev, keyboard.clone()],
+            },
+            None,
+        );
+        match client.pump(None).expect("pump") {
+            Some(SgcEvent::Advertised {
+                available_resources,
+            }) => assert_eq!(available_resources, vec![Resource::Fbdev, keyboard]),
+            other => panic!("expected Advertised, got {other:?}"),
+        }
         drop(client);
         drop(controller);
     }

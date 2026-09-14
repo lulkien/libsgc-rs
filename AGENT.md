@@ -37,7 +37,7 @@ Rust client library for the simple-graphics-controller daemon (@sgc). Drives `Sg
 
 ## Key Types & Functions
 - `SgcClient` — owns granted fds in `held: HashMap<Resource, OwnedFd>`; `fd(resource)` lends a dup; `acquire(resource)` blocks until granted; `pump(timeout)` waits for one server frame
-- `SgcEvent` — `Revoked { resource }` (drop fd, stop drawing) or `Granted { resource, fd }` (fresh dup, owned by caller)
+- `SgcEvent` — `Revoked { resource }` (drop fd, stop drawing), `Granted { resource, fd }` (fresh dup, owned by caller), or `Advertised { available_resources }` (the server's list changed: a device appeared or was removed — the whole list, so the app replaces its view)
 - `SgcError` — variants: `ConnectFailed`, `Denied { reason }`, `NotHeld { resource }`, `NotAvailable { resource }`, `Protocol(ProtocolError)`, `UnexpectedMessage(ServerMessage)`, `Io(io::Error)`
 - `OwnedFd` — Unix fd ownership via `ownership::OwnedFd`; `fd.as_raw_fd()` for C ABI interop
 - `read_framed`, `write_frame` — internal helpers for framing + SCM_RIGHTS fd passing
